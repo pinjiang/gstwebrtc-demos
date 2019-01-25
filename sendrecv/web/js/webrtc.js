@@ -13,8 +13,7 @@ var ws_port;
 // Set this to use a specific peer id instead of a random one
 var default_peer_id;
 // Override with your own STUN servers if you want
-var rtc_configuration = {iceServers: [{urls: "stun:stun.services.mozilla.com"},
-                                      {urls: "stun:stun.l.google.com:19302"}]};
+var rtc_configuration = {iceServers: [{ urls: "stun:10.170.201.19:3478" }]};
 // The default constraints that will be attempted. Can be overriden by the user.
 var default_constraints = {video: true, audio: true};
 
@@ -24,6 +23,40 @@ var send_channel;
 var ws_conn;
 // Promise for local stream after constraints are approved by the user
 var local_stream_promise;
+
+var repeatInterval=5 * 1000;
+
+function myGetStats(peer, callback) {
+    if (!!navigator.mozGetUserMedia) {
+		console.log("navigator.mozGetUserMedia");
+        peer.getStats(
+            function (res) {
+                var items = [];
+                res.forEach(function (result) {
+                    items.push(result);
+                });
+                callback(items);
+            },
+            callback
+        );
+    } else {
+		console.log("else");
+        peer.getStats(function (res) {
+            var items = [];
+            res.result().forEach(function (result) {
+                var item = {};
+                result.names().forEach(function (name) {
+                    item[name] = result.stat(name);
+                });
+                item.id = result.id;
+                item.type = result.type;
+                item.timestamp = result.timestamp;
+                items.push(item);
+            });
+            callback(items);
+        });
+    }
+};
 
 function getOurId() {
     return Math.floor(Math.random() * (9000 - 10) + 10).toString();
@@ -205,7 +238,7 @@ function websocketServerConnect() {
     } else {
         throw new Error ("Don't know how to connect to the signalling server with uri" + window.location);
     }
-    var ws_url = 'wss://' + ws_server + ':' + ws_port
+    var ws_url = 'ws://' + ws_server + ':' + ws_port
     setStatus("Connecting to server " + ws_url);
     ws_conn = new WebSocket(ws_url);
     /* When connected, immediately register with the server */
@@ -219,6 +252,22 @@ function websocketServerConnect() {
     ws_conn.addEventListener('close', onServerClose);
 }
 
+/* function getStats(peer) {
+    myGetStats(peer, function (results) {
+        for (var i = 0; i < results.length; ++i) {
+            var res = results[i];
+			if( res.type == "ssrc" ) {
+				console.log(res);
+			} 
+			console.log(res);
+        }
+
+        setTimeout(function () {
+            getStats(peer);
+        }, 1000);
+    });
+} */
+
 function onRemoteStreamAdded(event) {
     videoTracks = event.stream.getVideoTracks();
     audioTracks = event.stream.getAudioTracks();
@@ -229,6 +278,33 @@ function onRemoteStreamAdded(event) {
     } else {
         handleIncomingError('Stream with unknown tracks added, resetting');
     }
+	// getStats(peer_connection);
+	getStats(peer_connection, function(result) {
+		console.log("getStats");
+		//result.connectionType.remote.ipAddress
+		//result.connectionType.remote.candidateType
+		//result.connectionType.transport
+		//result.bandwidth.speed // bandwidth download speed (bytes per second)
+		
+		console.log("ipAddress:", result.connectionType.remote.ipAddress);
+		console.log("candidateType:", result.connectionType.remote.candidateType);
+		console.log("transport:", result.connectionType.transport);
+		console.log("speed:", result.bandwidth.speed);
+		
+		// to access native "results" array
+		result.results.forEach(function(item) {
+			if (item.type === 'ssrc' ) { /* && item.transportId === 'Channel-audio-1' */
+				var packetsLost = item.packetsLost;
+				var packetsSent = item.packetsSent;
+				// var audioInputLevel = item.audioInputLevel;
+				var trackId = item.googTrackId; // media stream track id
+				// var isAudio = item.mediaType === 'audio'; // audio or video
+				// var isSending = item.id.indexOf('_send') !== -1; // sender or receiver
+				console.log('SendRecv type', item.id.split('_send').pop());
+				console.log('MediaStream track type', item.mediaType);
+			}
+		});
+	}, repeatInterval);	
 }
 
 function errorUserMediaHandler() {

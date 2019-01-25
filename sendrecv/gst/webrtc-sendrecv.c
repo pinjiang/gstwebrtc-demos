@@ -6,6 +6,8 @@
  *
  * Author: Nirbheek Chauhan <nirbheek@centricular.com>
  */
+#include <glib-object.h>
+#include <gobject/gvaluetypes.h>
 #include <gst/gst.h>
 #include <gst/sdp/sdp.h>
 
@@ -17,6 +19,10 @@
 #include <json-glib/json-glib.h>
 
 #include <string.h>
+
+#define STUN_SERVER_PREFIX " stun-server=stun://"
+// #define RTP_CAPS_OPUS "application/x-rtp,media=audio,encoding-name=OPUS,payload="
+// #define RTP_CAPS_VP8  "application/x-rtp,media=video,encoding-name=VP8,payload="
 
 enum AppState {
   APP_STATE_UNKNOWN = 0,
@@ -45,14 +51,18 @@ static GObject *send_channel, *receive_channel;
 static SoupWebsocketConnection *ws_conn = NULL;
 static enum AppState app_state = 0;
 static const gchar *peer_id = NULL;
-static const gchar *server_url = "wss://webrtc.nirbheek.in:8443";
 static gboolean disable_ssl = FALSE;
+
+static const gchar *g_config_file = NULL;
+static gchar *g_id;
+static gchar *g_url;
+static gchar *g_stunserver;
+static gchar *g_pipeline;
 
 static GOptionEntry entries[] =
 {
-  { "peer-id", 0, 0, G_OPTION_ARG_STRING, &peer_id, "String ID of the peer to connect to", "ID" },
-  { "server", 0, 0, G_OPTION_ARG_STRING, &server_url, "Signalling server to connect to", "URL" },
-  { "disable-ssl", 0, 0, G_OPTION_ARG_NONE, &disable_ssl, "Disable ssl", NULL },
+  { "config",  0, 0, G_OPTION_ARG_STRING, &g_config_file, "Config File", NULL },
+  { "peer-id", 0, 0, G_OPTION_ARG_STRING, &peer_id,       "String ID of the peer to connect to", "ID" },
   { NULL },
 };
 
@@ -208,8 +218,7 @@ send_ice_candidate_message (GstElement * webrtc G_GNUC_UNUSED, guint mlineindex,
   g_free (text);
 }
 
-static void
-send_sdp_offer (GstWebRTCSessionDescription * offer)
+static void send_sdp_offer (GstWebRTCSessionDescription * offer)
 {
   gchar *text;
   JsonObject *msg, *sdp;
@@ -237,8 +246,7 @@ send_sdp_offer (GstWebRTCSessionDescription * offer)
 }
 
 /* Offer created by our pipeline, to be sent to the peer */
-static void
-on_offer_created (GstPromise * promise, gpointer user_data)
+static void on_offer_created (GstPromise * promise, gpointer user_data)
 {
   GstWebRTCSessionDescription *offer = NULL;
   const GstStructure *reply;
@@ -261,8 +269,7 @@ on_offer_created (GstPromise * promise, gpointer user_data)
   gst_webrtc_session_description_free (offer);
 }
 
-static void
-on_negotiation_needed (GstElement * element, gpointer user_data)
+static void on_negotiation_needed (GstElement * element, gpointer user_data)
 {
   GstPromise *promise;
 
@@ -271,9 +278,6 @@ on_negotiation_needed (GstElement * element, gpointer user_data)
   g_signal_emit_by_name (webrtc1, "create-offer", NULL, promise);
 }
 
-#define STUN_SERVER " stun-server=stun://stun.l.google.com:19302 "
-#define RTP_CAPS_OPUS "application/x-rtp,media=audio,encoding-name=OPUS,payload="
-#define RTP_CAPS_VP8 "application/x-rtp,media=video,encoding-name=VP8,payload="
 
 static void
 data_channel_on_error (GObject * dc, gpointer user_data)
@@ -323,20 +327,25 @@ on_data_channel (GstElement * webrtc, GObject * data_channel, gpointer user_data
   receive_channel = data_channel;
 }
 
-static gboolean
-start_pipeline (void)
+static gboolean start_pipeline ()
 {
   GstStateChangeReturn ret;
   GError *error = NULL;
 
-  pipe1 =
+  char* full_pipeline_str = g_strconcat("webrtcbin bundle-policy=max-bundle name=sendrecv ", STUN_SERVER_PREFIX, g_stunserver, " ",g_pipeline, "! sendrecv. ", NULL);
+   
+  /* pipe1 =
       gst_parse_launch ("webrtcbin bundle-policy=max-bundle name=sendrecv " STUN_SERVER
       "videotestsrc is-live=true pattern=ball ! videoconvert ! queue ! vp8enc deadline=1 ! rtpvp8pay ! "
       "queue ! " RTP_CAPS_VP8 "96 ! sendrecv. "
       "audiotestsrc is-live=true wave=red-noise ! audioconvert ! audioresample ! queue ! opusenc ! rtpopuspay ! "
       "queue ! " RTP_CAPS_OPUS "97 ! sendrecv. ",
-      &error);
+      &error); */
 
+  g_print("Full pipeline: %s\n", full_pipeline_str);
+  pipe1 = gst_parse_launch (full_pipeline_str, &error);
+  
+  g_free(full_pipeline_str);
   if (error) {
     g_printerr ("Failed to parse launch: %s\n", error->message);
     g_error_free (error);
@@ -641,7 +650,7 @@ connect_to_websocket_server_async (void)
   soup_session_add_feature (session, SOUP_SESSION_FEATURE (logger));
   g_object_unref (logger);
 
-  message = soup_message_new (SOUP_METHOD_GET, server_url);
+  message = soup_message_new (SOUP_METHOD_GET, g_url);
 
   g_print ("Connecting to server...\n");
 
@@ -658,7 +667,7 @@ check_plugins (void)
   gboolean ret;
   GstPlugin *plugin;
   GstRegistry *registry;
-  const gchar *needed[] = { "opus", "vpx", "nice", "webrtc", "dtls", "srtp",
+  const gchar *needed[] = { "opus", "omx", "nice", "webrtc", "dtls", "srtp",
       "rtpmanager", "videotestsrc", "audiotestsrc", NULL};
 
   registry = gst_registry_get ();
@@ -675,8 +684,101 @@ check_plugins (void)
   return ret;
 }
 
-int
-main (int argc, char *argv[])
+/*********************************************************************************************
+ * Description: Read configuration file                                                      *                                                 
+ *                                                                                           *
+ * Input :                                                                                   *
+ * Return:                                                                                   *
+ *********************************************************************************************/
+gboolean read_config(const char* filename) {
+  GError     *error;
+  JsonParser *parser;
+  JsonNode   *root;
+  JsonObject *object;
+  JsonObject *pipelines;
+  
+  int nums; 
+  gpointer keys;
+  
+  parser = json_parser_new();
+  
+  error = NULL;
+  json_parser_load_from_file (parser, filename, &error);
+  if (error) {
+      g_print ("Unable to parse `%s': %s\n", filename, error->message);
+      g_error_free (error);
+      g_object_unref (parser);
+      goto err;
+  }
+  
+  /* manipulate the object tree and then exit */
+  root = json_parser_get_root (parser);
+  
+  if (!JSON_NODE_HOLDS_OBJECT (root)) {
+    // g_printerr ("Unknown json message '%s', ignoring", text);
+    // g_object_unref (parser);
+    goto err;
+  }
+  object = json_node_get_object (root);
+
+  if (!json_object_has_member (object, "Num of Cameras")) { 
+    g_printerr ("ERROR: received message without 'Num of Cameras'");
+    goto err;
+  }
+  nums = json_object_get_int_member (object, "Num of Cameras");
+  
+  if (!json_object_has_member (object, "Url")) { 
+    g_printerr ("ERROR: received message without 'Url'");
+    goto err;
+  }
+  g_url = (char *)g_malloc0(strlen(json_object_get_string_member (object, "Url")));
+  strcpy(g_url, json_object_get_string_member (object, "Url"));
+  
+  if (!json_object_has_member (object, "Id")) {         
+    g_printerr ("ERROR: received message without 'Id'");
+    goto err;
+  }
+  g_id = (char *)g_malloc0(strlen(json_object_get_string_member (object, "Id")));
+  strcpy(g_id, json_object_get_string_member (object, "Id"));
+  
+  if (!json_object_has_member (object, "Stun-Server")) { 
+    g_printerr ("ERROR: received message without 'Stun-Server'");
+    goto err;
+  } 
+  g_stunserver = (char *)g_malloc0(strlen(json_object_get_string_member (object, "Stun-Server")));
+  strcpy(g_stunserver, json_object_get_string_member (object, "Stun-Server"));
+  
+  if (!json_object_has_member (object, "Camera Pipelines")) {
+    g_printerr ("ERROR: received message without 'Camera Pipelines'");
+    goto err;
+  }
+  pipelines = json_object_get_object_member(object, "Camera Pipelines");
+  keys   = json_object_get_members (json_object_get_object_member(object, "Camera Pipelines"));   
+
+  /* One pipeline supported */
+  for (int i = 0; i < nums; i++) {
+    const char * name = (const char *)g_slist_nth_data(keys, i); 
+    g_pipeline = g_malloc0(strlen(json_object_get_string_member(pipelines, name)));
+    strcpy(g_pipeline, json_object_get_string_member(pipelines, name));
+  } 
+  
+  g_list_free(keys);
+
+  g_object_unref (parser);
+  return TRUE;
+
+  err:
+    g_object_unref (parser); 
+    return FALSE;
+}
+
+/*********************************************************************************************
+ * Description:                                                                              *                                                 
+ *                                                                                           *
+ * Input :                                                                                   *
+ * Return:                                                                                   *
+ *********************************************************************************************/
+int main(int argc, char *argv[])
 {
   GOptionContext *context;
   GError *error = NULL;
@@ -689,22 +791,33 @@ main (int argc, char *argv[])
     return -1;
   }
 
+  if (!g_config_file || !peer_id) {
+    g_printerr ("--config and --peer-id is a required argument\n");
+    g_printerr ("%s", g_option_context_get_help (context, TRUE, NULL));
+    return -1;
+  }
+
   if (!check_plugins ())
     return -1;
 
-  if (!peer_id) {
-    g_printerr ("--peer-id is a required argument\n");
+  if(!read_config(g_config_file)) {
+    g_printerr("Error parsing JSON config file\n");
     return -1;
   }
 
   /* Disable ssl when running a localhost server, because
    * it's probably a test server with a self-signed certificate */
   {
-    GstUri *uri = gst_uri_from_string (server_url);
-    if (g_strcmp0 ("localhost", gst_uri_get_host (uri)) == 0 ||
-        g_strcmp0 ("127.0.0.1", gst_uri_get_host (uri)) == 0)
+    GstUri *uri = gst_uri_from_string (g_url);
+    if (g_strcmp0 ("localhost", gst_uri_get_host (uri)) == 0 
+        || g_strcmp0 ("127.0.0.1", gst_uri_get_host (uri)) == 0)
       disable_ssl = TRUE;
     gst_uri_unref (uri);
+  }
+
+  {
+    if (g_str_has_prefix(g_url, "ws://") )
+      disable_ssl = TRUE;
   }
 
   loop = g_main_loop_new (NULL, FALSE);
