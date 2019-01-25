@@ -13,7 +13,7 @@ var ws_port;
 // Set this to use a specific peer id instead of a random one
 var default_peer_id;
 // Override with your own STUN servers if you want
-var rtc_configuration = {iceServers: [{ urls: "stun:10.170.201.19:3478" }]};
+var rtc_configuration = {iceServers: [{ urls: "stun:122.112.211.178:3478" }]};
 // The default constraints that will be attempted. Can be overriden by the user.
 var default_constraints = {video: true, audio: true};
 
